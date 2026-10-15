@@ -171,6 +171,86 @@ async function requestJev(state, questions) {
   throw new JevApiError(lastNetworkError ? 'Jev API bağlantısı kurulamadı.' : 'Jev API isteği başarısız oldu.');
 }
 
+async function requestClef(state, questions) {
+  const accountId = process.env.CLOUDFLARE_ACCOUNT_ID?.trim();
+  const apiToken = process.env.CLOUDFLARE_API_TOKEN?.trim();
+  if (!accountId) {
+    throw new JevApiError('CLOUDFLARE_ACCOUNT_ID bulunamadı. Cloudflare hesabının Account ID değerini ayarla.');
+  }
+  if (!/^[a-f0-9]{32}$/i.test(accountId)) {
+    throw new JevApiError('CLOUDFLARE_ACCOUNT_ID biçimi geçersiz görünüyor; Cloudflare dashboard hesabındaki 32 karakterlik Account ID değerini kontrol et.');
+  }
+  if (!apiToken) {
+    throw new JevApiError('CLOUDFLARE_API_TOKEN bulunamadı. Workers AI erişim yetkili Cloudflare API tokenını ayarla.');
+  }
+
+  const endpoint = `https://api.cloudflare.com/client/v4/accounts/${accountId}/ai/run/@cf/cloudflare/clef-flash`;
+  const payload = { model: 'clef-flash', state, questions };
+
+  let response;
+  try {
+    response = await fetch(endpoint, {
+      method: 'POST',
+      headers: {
+        Authorization: `Bearer ${apiToken}`,
+        'Content-Type': 'application/json',
+        Accept: 'application/json',
+      },
+      body: JSON.stringify(payload),
+      signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS),
+    });
+  } catch (error) {
+    if (error?.name === 'TimeoutError' || error?.name === 'AbortError') {
+      throw new JevApiError(`Clef-Flash isteği ${REQUEST_TIMEOUT_MS / 1000} saniyede zaman aşımına uğradı.`);
+    }
+    throw new JevApiError('Cloudflare Workers AI bağlantısı kurulamadı. İnternet bağlantısını ve Cloudflare API erişimini kontrol et.');
+  }
+
+  let data;
+  try {
+    data = await response.json();
+  } catch {
+    throw new JevApiError('Cloudflare Clef API geçerli JSON yanıtı döndürmedi.', response.status);
+  }
+
+  if (!response.ok || data?.success === false) {
+    const status = response.status;
+    if (status === 401) {
+      throw new JevApiError('Cloudflare kimlik doğrulaması başarısız (401). CLOUDFLARE_API_TOKEN değerini kontrol et.', status);
+    }
+    if (status === 403) {
+      const providerMessage = Array.isArray(data?.errors) ? data.errors.map((item) => item?.message ?? '').join(' ') : '';
+      throw new JevApiError(`Cloudflare Clef erişimi reddedildi (403). API tokenında Account > Workers AI > Read yetkisi bulunduğunu ve Clef modeline erişim olduğunu kontrol et.${providerMessage ? ` Cloudflare mesajı: ${providerMessage.slice(0, 300)}` : ''}`, status);
+    }
+    if (status === 429) {
+      throw new JevApiError('Cloudflare Workers AI 429 döndürdü: günlük 10.000 Neuron ücretsiz tahsisi dolmuş veya kapasite sınırına ulaşılmış olabilir. Ücretli modele otomatik geçilmedi.', status);
+    }
+    if (status === 400 || status === 422) {
+      throw new JevApiError(`Clef isteği reddedildi (${status}). Model kimliğini, soru türlerini ve criteria alanlarını kontrol et.`, status);
+    }
+    if (status === 402) {
+      throw new JevApiError('Cloudflare API erişim/billing gereksinimi döndürdü (402). Hesap planını ve modelin ücretsiz katmanda kullanılabilirliğini kontrol et.', status);
+    }
+    if (status >= 500) {
+      throw new JevApiError(`Cloudflare Workers AI sunucu hatası döndürdü (${status}). Bir süre sonra yeniden dene.`, status);
+    }
+    const apiMessage = Array.isArray(data?.errors) ? data.errors.map((item) => item?.message ?? '').join(' ').slice(0, 300) : '';
+    throw new JevApiError(`Clef API isteği başarısız oldu (HTTP ${status}).${apiMessage ? ` Cloudflare mesajı: ${apiMessage}` : ''}`, status);
+  }
+
+  const result = data?.result && typeof data.result === 'object' ? data.result : data;
+  if (!result || typeof result !== 'object' || !result.answers || typeof result.answers !== 'object') {
+    throw new JevApiError('Cloudflare Clef API yanıtı beklenen answers alanını içermiyor.', response.status);
+  }
+
+  return {
+    provider: 'cloudflare-workers-ai',
+    model: result.model ?? '@cf/cloudflare/clef-flash',
+    answers: result.answers,
+    usage: result.usage ?? null,
+  };
+}
+
 function jsonToolResult(data) {
   return {
     content: [{ type: 'text', text: JSON.stringify(data, null, 2) }],
@@ -182,13 +262,13 @@ function errorToolResult(error) {
   // API keys and request bodies are intentionally never included in error output.
   return {
     isError: true,
-    content: [{ type: 'text', text: `Jev MCP hatası: ${message}` }],
+    content: [{ type: 'text', text: `Decision MCP hatası: ${message}` }],
   };
 }
 
 const server = new McpServer({
   name: 'jev-bridge',
-  version: '1.0.0',
+  version: '1.1.0',
 });
 
 server.registerTool(
@@ -261,6 +341,83 @@ server.registerTool(
       return jsonToolResult({
         ...result,
         note: 'Jev evaluated only the summaries supplied to this tool. It did not inspect repository files or execute tests. Confirm conclusions using real code review and test output.',
+      });
+    } catch (error) {
+      return errorToolResult(error);
+    }
+  },
+);
+
+server.registerTool(
+  'clef_assess',
+  {
+    title: 'Clef-Flash Structured Assessment',
+    description: 'Evaluate a supplied state/context with Cloudflare Workers AI Clef-Flash using typed noul, choice, or score questions. Returns structured answers. Requires CLOUDFLARE_ACCOUNT_ID and CLOUDFLARE_API_TOKEN. Uses only Clef-Flash; does not fall back to paid or other models. This is a decision-support signal, not proof or a substitute for testing/security review.',
+    inputSchema: z.object({
+      state: z.string().min(1).max(MAX_STATE_CHARS).describe('Context for Clef-Flash to evaluate. Do not include secrets, API keys, .env contents, or unnecessary private data.'),
+      questions_json: z.string().min(2).max(MAX_QUESTIONS_JSON_CHARS).describe('JSON object mapping question IDs to {type, instructions, criteria?}. Supported types: noul, choice, score.'),
+    }),
+  },
+  async ({ state, questions_json }) => {
+    try {
+      const questions = validateQuestionsJson(questions_json);
+      const result = await requestClef(state, questions);
+      return jsonToolResult(result);
+    } catch (error) {
+      return errorToolResult(error);
+    }
+  },
+);
+
+server.registerTool(
+  'clef_code_triage',
+  {
+    title: 'Clef-Flash Code Change Triage',
+    description: 'Classify a user-provided code-change summary and test summary using Cloudflare Clef-Flash. Clef does not read the repository or run tests itself; the supplied summaries are the only evidence. Never treat its output as a definitive security verdict.',
+    inputSchema: z.object({
+      change_summary: z.string().min(1).max(6_000).describe('Short summary of the intended code changes. Do not paste secrets.'),
+      files_or_diff_summary: z.string().min(1).max(6_000).describe('Relevant filenames and concise diff summary; do not send entire repositories.'),
+      test_results: z.string().min(1).max(4_000).describe('Tests actually run and their results, or explicitly state that tests were not run.'),
+    }),
+  },
+  async ({ change_summary, files_or_diff_summary, test_results }) => {
+    try {
+      const state = [
+        'TASK: Triage a software change using only the evidence supplied below.',
+        'IMPORTANT: Do not assume files were inspected or tests executed beyond explicit inputs. Missing information should increase caution.',
+        `CHANGE SUMMARY:\n${change_summary}`,
+        `FILES / DIFF SUMMARY:\n${files_or_diff_summary}`,
+        `TEST RESULTS:\n${test_results}`,
+      ].join('\n\n');
+
+      const questions = {
+        security_concern: {
+          type: 'noul',
+          instructions: 'Based only on the supplied summaries, is there a plausible security, privacy, authentication, authorization, or secret-handling concern that merits explicit human review?',
+        },
+        priority: {
+          type: 'choice',
+          instructions: 'Based only on the supplied summaries, what review priority is most appropriate? Use high for security-sensitive, data-loss, auth, broad architectural, or critical release changes; medium for behavior/API/dependency changes or meaningful test gaps; low for isolated low-impact documentation or formatting changes.',
+          criteria: {
+            low: 'Low-impact, isolated change with low apparent consequence.',
+            medium: 'Meaningful behavioral change, dependency/interface change, or non-critical test gap.',
+            high: 'Potential security/privacy/data-loss issue, critical behavior, broad change, or serious test failure.',
+          },
+        },
+        regression_concern: {
+          type: 'noul',
+          instructions: 'Do the supplied summaries indicate a plausible regression concern, such as behavior changes, broad refactoring, interface/dependency changes, or failed/missing relevant tests?',
+        },
+        human_review_recommended: {
+          type: 'noul',
+          instructions: 'Should a human review the actual diff and relevant test results before merging or releasing, given the provided evidence and uncertainty?',
+        },
+      };
+
+      const result = await requestClef(state, questions);
+      return jsonToolResult({
+        ...result,
+        note: 'Clef-Flash evaluated only the summaries supplied to this tool. It did not inspect repository files or execute tests. Confirm conclusions using real code review and test output.',
       });
     } catch (error) {
       return errorToolResult(error);
