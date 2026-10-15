@@ -1,0 +1,19 @@
+{
+  "name": "jev-claude-code-bridge",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Local MCP bridge from Claude Code to the OpenCode Zen Jev 1.13 Free structured-decision API.",
+  "type": "module",
+  "engines": {
+    "node": ">=20"
+  },
+  "scripts": {
+    "start": "node src/index.mjs",
+    "check": "node --check src/index.mjs && node --check scripts/test-api.mjs",
+    "test:api": "node scripts/test-api.mjs"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/server": "latest",
+    "zod": "latest"
+  }
+}
